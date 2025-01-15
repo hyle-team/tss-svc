@@ -25,6 +25,7 @@ type DefaultSigningSession struct {
 	wg     *sync.WaitGroup
 
 	connectedPartiesCount func() int
+	parties               []p2p.Party
 	partiesCount          int
 
 	signingParty interface {
@@ -108,7 +109,7 @@ func (s *DefaultSigningSession) Receive(request *p2p.SubmitRequest) error {
 		return errors.New("nil request")
 	}
 	if request.Type != p2p.RequestType_SIGN {
-		return errors.New("invalid request type")
+		return errors.New("invalid request type" + request.Type.String())
 	}
 
 	data := &p2p.TssData{}
@@ -123,6 +124,10 @@ func (s *DefaultSigningSession) Receive(request *p2p.SubmitRequest) error {
 
 	s.signingParty.Receive(sender, data)
 	return nil
+}
+
+func (s *DefaultSigningSession) AddStartTime(t time.Duration) {
+	s.params.StartTime = s.params.StartTime.Add(t)
 }
 
 // RegisterIdChangeListener is a no-op for DefaultSigningSession

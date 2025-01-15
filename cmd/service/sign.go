@@ -10,10 +10,12 @@ import (
 	tss_lib "github.com/bnb-chain/tss-lib/v2/tss"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/hyle-team/tss-svc/cmd/utils"
+	"github.com/hyle-team/tss-svc/internal/bridge/chain"
 	"github.com/hyle-team/tss-svc/internal/config"
 	"github.com/hyle-team/tss-svc/internal/p2p"
 	"github.com/hyle-team/tss-svc/internal/secrets/vault"
 	"github.com/hyle-team/tss-svc/internal/tss"
+	"github.com/hyle-team/tss-svc/internal/tss/consensus"
 	"github.com/hyle-team/tss-svc/internal/tss/session"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -22,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func init() {
@@ -44,9 +47,9 @@ var signCmd = &cobra.Command{
 		}
 
 		dataToSign := args[0]
-		if len(dataToSign) == 0 {
-			return errors.Wrap(errors.New("empty data to-sign"), "invalid data")
-		}
+		//if len(dataToSign) == 0 {
+		//	return errors.Wrap(errors.New("empty data to-sign"), "invalid data")
+		//}
 
 		storage := vault.NewStorage(cfg.VaultClient())
 
@@ -65,20 +68,12 @@ var signCmd = &cobra.Command{
 
 		connectionManager := p2p.NewConnectionManager(cfg.Parties(), p2p.PartyStatus_SIGNING, cfg.Log().WithField("component", "connection_manager"))
 
-		session := session.NewDefaultSigningSession(
-			tss.LocalSignParty{
-				Address:   account.CosmosAddress(),
-				Data:      localSaveData,
-				Threshold: cfg.TSSParams().SigningSessionParams().Threshold,
-			},
-			cfg.TSSParams().SigningSessionParams(),
-			cfg.Log().WithField("component", "signing_session"),
-			cfg.Parties(),
-			[]byte(dataToSign),
-			connectionManager.GetReadyCount,
-		)
+		consensus := session.NewConsensusSession(consensus.LocalParams{
+			PartyStatus: consensus.Signer,
+			Address:     account.CosmosAddress(),
+		}, cfg.TSSParams().ConsensusParams(), cfg.Log().WithField("component", "consensus_session"), []byte(dataToSign), connectionManager.GetReadyCount, cfg.Parties(), form, validate, account.CosmosAddress(), chain.ChainMetadata{}, "Bitcoin", selector)
 
-		sessionManager := p2p.NewSessionManager(session)
+		sessionManager := p2p.NewSessionManager(consensus)
 		errGroup.Go(func() error {
 			server := p2p.NewServer(cfg.GRPCListener(), sessionManager)
 			server.SetStatus(p2p.PartyStatus_SIGNING)
@@ -88,10 +83,38 @@ var signCmd = &cobra.Command{
 		errGroup.Go(func() error {
 			defer cancel()
 
-			if err := session.Run(ctx); err != nil {
+			if err := consensus.Run(ctx); err != nil {
+				return errors.Wrap(err, "failed to run consensus session")
+			}
+			data, parties, err := consensus.WaitFor()
+			cfg.Log().Info("consensus session finished ", "parties ", parties, "err ", err, "data ", data)
+			if data == nil || parties == nil {
+				if err != nil {
+					return errors.Wrap(err, "consensus error")
+				}
+				cfg.Log().Info("not a signer")
+				return nil
+			}
+			cfg.Log().Info("Try to start signing session")
+			connectionManager := p2p.NewConnectionManager(parties, p2p.PartyStatus_SIGNING, cfg.Log().WithField("component", "connection_manager"))
+			signSession := session.NewDefaultSigningSession(
+				tss.LocalSignParty{
+					Address:   account.CosmosAddress(),
+					Data:      localSaveData,
+					Threshold: cfg.TSSParams().SigningSessionParams().Threshold,
+				},
+				cfg.TSSParams().SigningSessionParams(),
+				cfg.Log().WithField("component", "signing_session"),
+				parties,
+				data,
+				connectionManager.GetReadyCount,
+			)
+			sessionManager.Add(signSession)
+			signSession.AddStartTime(10 * time.Second)
+			if err := signSession.Run(ctx); err != nil {
 				return errors.Wrap(err, "failed to run signing session")
 			}
-			result, err := session.WaitFor()
+			result, err := signSession.WaitFor()
 			if err != nil {
 				return errors.Wrap(err, "failed to obtain signing session result")
 			}
@@ -101,7 +124,7 @@ var signCmd = &cobra.Command{
 			if err != nil {
 				return errors.Wrap(err, "failed to save signing result")
 			}
-			verifySignature(localSaveData, []byte(dataToSign), result, cfg)
+			verifySignature(localSaveData, data, result, cfg)
 			return nil
 		})
 		return errGroup.Wait()
@@ -142,4 +165,19 @@ func verifySignature(localData *keygen.LocalPartySaveData, inputData []byte, sig
 			cfg.Log().Warn("signature is invalid")
 		}
 	}
+}
+
+func form(data []byte) ([]byte, error) {
+	return data, nil
+}
+
+func validate(data []byte) (bool, error) {
+	return true, nil
+}
+
+func selector(chainId string, data []byte) ([]byte, error) {
+	if data == nil {
+		return nil, errors.New("no data")
+	}
+	return data, nil
 }
