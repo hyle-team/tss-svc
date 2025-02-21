@@ -1,10 +1,14 @@
 package finalizer
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
 
 	"github.com/bnb-chain/tss-lib/v2/common"
-	"github.com/hyle-team/tss-svc/internal/bridge/clients/zano"
+	"github.com/btcsuite/btcd/wire"
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/hyle-team/tss-svc/internal/bridge/clients/bitcoin"
 	"github.com/hyle-team/tss-svc/internal/bridge/withdrawal"
 	core "github.com/hyle-team/tss-svc/internal/core/connector"
 	database "github.com/hyle-team/tss-svc/internal/db"
@@ -13,14 +17,16 @@ import (
 	"gitlab.com/distributed_lab/logan/v3"
 )
 
-type ZanoFinalizer struct {
-	withdrawalData *withdrawal.ZanoWithdrawalData
-	signature      *common.SignatureData
+type BitcoinFinalizer struct {
+	withdrawalData *withdrawal.BitcoinWithdrawalData
+	signatures     []*common.SignatureData
+
+	tssPub []byte
 
 	db   database.DepositsQ
 	core *core.Connector
 
-	client *zano.Client
+	client *bitcoin.Client
 
 	localPartyProposer bool
 
@@ -28,32 +34,39 @@ type ZanoFinalizer struct {
 	logger  *logan.Entry
 }
 
-func NewZanoFinalizer(db database.DepositsQ, core *core.Connector, client *zano.Client, logger *logan.Entry) *ZanoFinalizer {
-	return &ZanoFinalizer{
+func NewBitcoinFinalizer(
+	db database.DepositsQ,
+	core *core.Connector,
+	client *bitcoin.Client,
+	pubKey *ecdsa.PublicKey,
+	logger *logan.Entry,
+) *BitcoinFinalizer {
+	return &BitcoinFinalizer{
 		db:      db,
 		core:    core,
 		errChan: make(chan error),
 		logger:  logger,
 		client:  client,
+		tssPub:  ethcrypto.CompressPubkey(pubKey),
 	}
 }
 
-func (f *ZanoFinalizer) WithData(withdrawalData *withdrawal.ZanoWithdrawalData) *ZanoFinalizer {
+func (f *BitcoinFinalizer) WithData(withdrawalData *withdrawal.BitcoinWithdrawalData) *BitcoinFinalizer {
 	f.withdrawalData = withdrawalData
 	return f
 }
 
-func (f *ZanoFinalizer) WithSignature(signature *common.SignatureData) *ZanoFinalizer {
-	f.signature = signature
+func (f *BitcoinFinalizer) WithSignatures(signatures []*common.SignatureData) *BitcoinFinalizer {
+	f.signatures = signatures
 	return f
 }
 
-func (f *ZanoFinalizer) WithLocalPartyProposer(proposer bool) *ZanoFinalizer {
+func (f *BitcoinFinalizer) WithLocalPartyProposer(proposer bool) *BitcoinFinalizer {
 	f.localPartyProposer = proposer
 	return f
 }
 
-func (f *ZanoFinalizer) Finalize(ctx context.Context) error {
+func (f *BitcoinFinalizer) Finalize(ctx context.Context) error {
 	f.logger.Info("finalization started")
 	go f.finalize(ctx)
 
@@ -74,8 +87,18 @@ func (f *ZanoFinalizer) Finalize(ctx context.Context) error {
 	}
 }
 
-func (f *ZanoFinalizer) finalize(ctx context.Context) {
-	if err := f.db.UpdateWithdrawalTx(f.withdrawalData.DepositIdentifier(), f.withdrawalData.ProposalData.TxId); err != nil {
+func (f *BitcoinFinalizer) finalize(ctx context.Context) {
+	tx := wire.MsgTx{}
+	if err := tx.Deserialize(bytes.NewReader(f.withdrawalData.ProposalData.SerializedTx)); err != nil {
+		f.errChan <- errors.Wrap(err, "failed to deserialize transaction")
+		return
+	}
+	if err := bitcoin.InjectSignatures(&tx, f.signatures, f.tssPub); err != nil {
+		f.errChan <- errors.Wrap(err, "failed to inject signatures")
+		return
+	}
+
+	if err := f.db.UpdateWithdrawalTx(f.withdrawalData.DepositIdentifier(), tx.TxHash().String()); err != nil {
 		f.errChan <- errors.Wrap(err, "failed to update withdrawal tx")
 		return
 	}
@@ -85,16 +108,9 @@ func (f *ZanoFinalizer) finalize(ctx context.Context) {
 		return
 	}
 
-	_, err := f.client.EmitAssetSigned(zano.SignedTransaction{
-		Signature: zano.EncodeSignature(f.signature),
-		UnsignedTransaction: zano.UnsignedTransaction{
-			ExpectedTxHash: f.withdrawalData.ProposalData.TxId,
-			FinalizedTx:    f.withdrawalData.ProposalData.FinalizedTx,
-			Data:           f.withdrawalData.ProposalData.UnsignedTx,
-		},
-	})
+	_, err := f.client.SendSignedTransaction(&tx)
 	if err != nil {
-		f.errChan <- errors.Wrap(err, "failed to emit signed transaction")
+		f.errChan <- errors.Wrap(err, "failed to send signed transaction")
 		return
 	}
 
@@ -103,7 +119,6 @@ func (f *ZanoFinalizer) finalize(ctx context.Context) {
 		f.errChan <- errors.Wrap(err, "failed to get deposit")
 		return
 	}
-
 	if err = f.core.SubmitDeposits(ctx, dep.ToTransaction()); err != nil {
 		f.errChan <- errors.Wrap(err, "failed to submit deposit")
 		return

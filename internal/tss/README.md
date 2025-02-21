@@ -126,6 +126,13 @@ It is responsible for:
 - providing the specific session with other parties session messages;
 - providing the requestor with the specific session information;
 
+### Bitcoin signing session
+Bitcoin signing session is a special session that is used to process the Bitcoin withdrawals.
+It is different from the EVM and Zano sessions as it requires multiple UTXOs to be signed independently.
+Thus, the session includes N signing rounds, where N is the number of UTXOs to be signed in the transaction.
+Respectively, the signing step time bounds are multiplied by N to provide enough time for the parties to sign all UTXOs.
+
+**TODO: COMPLETE BTC WITH INPUTS COLLECTOR STEP**
 
 ### Catchup
 For the initial sessions start, the parties are required to have the same session start time and initial session identifier.
@@ -157,10 +164,10 @@ Proposer is the signer as well.
 
 The consensus process is performed by the following steps:
 1. All parties in the network should deterministically choose the proposer for the current signing session.
-Proposer is selected using the deterministic function TODO:ADD-FUNCTION using the [`ChaCha8`](#dependencies) pseudo-random number generator.
+Proposer is selected using the deterministic function `f(session_id)` using the [`ChaCha8`](#dependencies) pseudo-random number generator.
 2. Proposer selects the unsigned withdrawal request based on the session context (f.e. deposit on the specific chain).
 According to the provided signing data constructor function (different for each chain), the proposer constructs the data to be signed and other metadata if needed.
-It shares the constructed data and metadata with TODO:ALL-OR-ACTIVE parties in the network.
+It shares the constructed data and metadata with all parties in the network.
 If there is no data to be signed, waiting for next session / broadcasting the no-signing-data message.
 3. Parties that received proposer request (signers) should:
    - check if request provider matches the current session proposer;
